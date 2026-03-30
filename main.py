@@ -2,9 +2,13 @@ import os
 import time
 import json
 import math
+import threading
 import requests
 from collections import deque
 from datetime import datetime
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+import uvicorn
 
 # ==========================
 # CONFIG
@@ -21,289 +25,149 @@ HISTORY_LEN = int(os.getenv("HISTORY_LEN", 20))
 USERNAME = os.getenv("IOL_USER")
 PASSWORD = os.getenv("IOL_PASS")
 
-TIMEOUT = 5
-MODEL_FILE = "model.json"
+PORT = int(os.getenv("PORT", 8080))
 
 # ==========================
-# GLOBAL STATE
+# STATE
 # ==========================
 token = None
 token_expiry = 0
-
-history = {
-    symbol: deque(maxlen=HISTORY_LEN) for symbol in SYMBOLS
-}
-
-model = {
-    "weights": [0.0] * 5,
-    "bias": 0.0,
-    "lr": 0.01
-}
+history = {s: deque(maxlen=HISTORY_LEN) for s in SYMBOLS}
+last_signals = {}
 
 # ==========================
 # AUTH
 # ==========================
 def login():
     global token, token_expiry
-    try:
-        response = requests.post(
-            LOGIN_URL,
-            data={
-                "username": USERNAME,
-                "password": PASSWORD,
-                "grant_type": "password"
-            },
-            timeout=TIMEOUT
-        )
+    r = requests.post(LOGIN_URL, data={
+        "username": USERNAME,
+        "password": PASSWORD,
+        "grant_type": "password"
+    })
+    if r.status_code == 200:
+        data = r.json()
+        token = data["access_token"]
+        token_expiry = time.time() + data["expires_in"] - 60
+        print("[LOGIN OK]")
+    else:
+        print("[LOGIN ERROR]", r.text)
 
-        if response.status_code == 200:
-            data = response.json()
-            token = data.get("access_token")
-            expires_in = data.get("expires_in", 3600)
-            token_expiry = time.time() + expires_in - 60
-            print("[LOGIN OK]", flush=True)
-        else:
-            print(f"[LOGIN ERROR] {response.status_code}", flush=True)
-
-    except Exception as e:
-        print(f"[LOGIN EXCEPTION] {e}", flush=True)
-
-
-def get_headers():
+def headers():
     global token
     if token is None or time.time() > token_expiry:
         login()
     return {"Authorization": f"Bearer {token}"}
 
 # ==========================
-# DATA FETCH (DEBUG ROBUSTO)
+# DATA
 # ==========================
-
 def get_quote(symbol):
     try:
-        url = f"{QUOTE_URL}/{symbol}/Cotizacion"
-        response = requests.get(url, headers=get_headers(), timeout=TIMEOUT)
-
-        print(f"[DEBUG] {symbol} STATUS: {response.status_code}", flush=True)
-
-        if response.status_code != 200:
-            print(f"[HTTP ERROR] {symbol} {response.status_code}", flush=True)
-            print(response.text, flush=True)
-            return None
-
-        data = response.json()
-
-        print(f"[DEBUG DATA] {symbol}: {data}", flush=True)
+        r = requests.get(f"{QUOTE_URL}/{symbol}/Cotizacion", headers=headers())
+        data = r.json()
 
         price = data.get("ultimoPrecio")
         puntas = data.get("puntas", [])
 
-        if not puntas:
-            print(f"[NO PUNTAS] {symbol}", flush=True)
+        if not price:
             return None
 
-        punta = puntas[0]
+        if not puntas:
+            return {"price": price, "bid": 0, "ask": 0}
 
+        p = puntas[0]
         return {
-            "price": float(price),
-            "bid_size": float(punta.get("cantidadCompra", 0)),
-            "ask_size": float(punta.get("cantidadVenta", 0))
+            "price": price,
+            "bid": p["cantidadCompra"],
+            "ask": p["cantidadVenta"]
         }
 
-    except Exception as e:
-        print(f"[DATA ERROR] {symbol} {e}", flush=True)
-        return None
-# ==========================
-# SIGNALS
-# ==========================
-def detect_persistence(hist):
-    if len(hist) < 5:
-        return False
-    large = [x for x in hist if x["bid_size"] > 50000 or x["ask_size"] > 50000]
-    return len(large) >= int(len(hist) * 0.6)
-
-
-def detect_spoofing(hist):
-    if len(hist) < 5:
-        return False
-    spikes = [x for x in hist if x["bid_size"] > 70000 or x["ask_size"] > 70000]
-    if len(spikes) < 2:
-        return False
-    last = hist[-1]
-    return last["bid_size"] < 20000 and last["ask_size"] < 20000
-
-
-def detect_absorption(hist):
-    if len(hist) < 5:
-        return False
-    prices = [x["price"] for x in hist]
-    return max(prices) - min(prices) < 0.2
-
-
-def detect_momentum(hist):
-    if len(hist) < 2:
-        return 0
-    start = hist[0]["price"]
-    end = hist[-1]["price"]
-    if end > start:
-        return 1
-    elif end < start:
-        return -1
-    return 0
-
-# ==========================
-# SCORING
-# ==========================
-def compute_score(hist):
-    score = 50
-
-    if detect_persistence(hist):
-        score += 40
-    if detect_absorption(hist):
-        score += 30
-    if detect_spoofing(hist):
-        score -= 50
-
-    momentum = detect_momentum(hist)
-    if momentum > 0:
-        score += 20
-    elif momentum < 0:
-        score -= 20
-
-    return max(0, min(100, score))
-
-
-def decision(score):
-    if score > 70:
-        return "COMPRAR"
-    elif score >= 50:
-        return "HOLD"
-    return "NO TRADE"
-
-# ==========================
-# ML MODEL
-# ==========================
-def load_model():
-    global model
-    if os.path.exists(MODEL_FILE):
-        try:
-            with open(MODEL_FILE, "r") as f:
-                model = json.load(f)
-                print("[MODEL LOADED]", flush=True)
-        except:
-            print("[MODEL LOAD ERROR]", flush=True)
-
-
-def save_model():
-    try:
-        with open(MODEL_FILE, "w") as f:
-            json.dump(model, f)
     except:
-        pass
-
-
-def sigmoid(x):
-    return 1 / (1 + math.exp(-x))
-
-
-def extract_features(hist):
-    if len(hist) < 3:
         return None
+
+# ==========================
+# LOGICA
+# ==========================
+def compute_signal(hist):
+    if len(hist) < 3:
+        return "WAIT"
 
     last = hist[-1]
     prev = hist[-2]
 
-    price = last["price"]
-    bid = last["bid_size"]
-    ask = last["ask_size"]
+    # sin liquidez
+    if last["bid"] == 0 and last["ask"] == 0:
+        return "SIN MERCADO"
 
-    imbalance = (bid - ask) / (bid + ask + 1)
-    spread = abs(bid - ask)
-    momentum = price - prev["price"]
+    # imbalance
+    if last["ask"] > 0 and last["bid"] / last["ask"] > 10:
+        return "BUY"
 
-    return [bid, ask, imbalance, spread, momentum]
+    # momentum
+    if last["price"] > prev["price"]:
+        return "UP"
+    elif last["price"] < prev["price"]:
+        return "DOWN"
 
-
-def predict(features):
-    z = model["bias"]
-    for i in range(len(features)):
-        z += model["weights"][i] * features[i]
-    return sigmoid(z)
-
-
-def train(features, label):
-    pred = predict(features)
-    error = label - pred
-
-    for i in range(len(model["weights"])):
-        model["weights"][i] += model["lr"] * error * features[i]
-
-    model["bias"] += model["lr"] * error
-
-
-def generate_label(hist, horizon=3):
-    if len(hist) < horizon + 1:
-        return None
-    current = hist[-horizon]["price"]
-    future = hist[-1]["price"]
-    return 1 if future > current else 0
+    return "FLAT"
 
 # ==========================
-# MAIN LOOP
+# BOT LOOP
 # ==========================
-def run():
-    print("[BOT STARTED]", flush=True)
-    load_model()
-
+def bot_loop():
+    print("[BOT STARTED]")
     while True:
         try:
-            for symbol in SYMBOLS:
-                data = get_quote(symbol)
-
-                if data is None:
+            for s in SYMBOLS:
+                d = get_quote(s)
+                if not d:
                     continue
 
-                history[symbol].append(data)
+                history[s].append(d)
+                signal = compute_signal(history[s])
 
-                # ML
-                features = extract_features(history[symbol])
-                ml_prob = None
+                last_signals[s] = {
+                    "price": d["price"],
+                    "signal": signal,
+                    "time": datetime.now().strftime("%H:%M:%S")
+                }
 
-                if features:
-                    ml_prob = predict(features)
-
-                label = generate_label(history[symbol])
-
-                if features and label is not None:
-                    train(features, label)
-
-                # Score híbrido
-                score = compute_score(history[symbol])
-
-                if ml_prob is not None:
-                    score = int(0.7 * score + 0.3 * (ml_prob * 100))
-
-                action = decision(score)
-
-                timestamp = datetime.now().strftime("%H:%M:%S")
-
-                print(
-                    f"{timestamp} | {symbol} | {data['price']:.2f} | {action} | Prob: {score}%",
-                    flush=True
-                )
-
-            # guardar modelo cada 60s
-            if int(time.time()) % 60 == 0:
-                save_model()
+                print(s, d["price"], signal)
 
             time.sleep(REFRESH)
 
         except Exception as e:
-            print(f"[LOOP ERROR] {e}", flush=True)
+            print("[ERROR]", e)
             time.sleep(5)
 
 # ==========================
-# ENTRYPOINT
+# DASHBOARD
+# ==========================
+app = FastAPI()
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    html = "<h1>📊 BOT EN VIVO</h1>"
+
+    for s, data in last_signals.items():
+        html += f"""
+        <div>
+            <h2>{s}</h2>
+            <p>Precio: {data['price']}</p>
+            <p>Señal: <b>{data['signal']}</b></p>
+            <p>Hora: {data['time']}</p>
+        </div>
+        <hr>
+        """
+
+    return html
+
+# ==========================
+# START
 # ==========================
 if __name__ == "__main__":
-    run()
+    t = threading.Thread(target=bot_loop)
+    t.start()
+
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
