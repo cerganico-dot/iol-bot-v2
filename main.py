@@ -76,19 +76,23 @@ def get_quote(symbol):
         url = f"{QUOTE_URL}/{symbol}/Cotizacion"
 
         r = requests.get(url, headers=get_headers(), timeout=10)
-        data = r.json()
 
-        print(f"[DEBUG DATA] {symbol}: {data}", flush=True)
+        if r.status_code != 200:
+            print(f"[HTTP ERROR] {symbol}: {r.status_code}", flush=True)
+            return None
+
+        data = r.json()
 
         price = data.get("ultimoPrecio")
         puntas = data.get("puntas", [])
 
+        print(f"[DATA OK] {symbol} price={price}", flush=True)
+
         if price is None:
-            print(f"[NO PRICE] {symbol}", flush=True)
             return None
 
+        # fallback si no hay mercado
         if not puntas:
-            print(f"[NO PUNTAS] {symbol}", flush=True)
             return {"price": price, "bid": 0, "ask": 0}
 
         p = puntas[0]
@@ -100,15 +104,15 @@ def get_quote(symbol):
         }
 
     except Exception as e:
-        print(f"[ERROR GET QUOTE] {symbol}: {e}", flush=True)
+        print(f"[ERROR GET] {symbol}: {e}", flush=True)
         return None
 
 # ==========================
-# SIGNAL LOGIC
+# SIGNAL
 # ==========================
 def compute_signal(hist):
-    if len(hist) < 3:
-        return "WAIT"
+    if len(hist) < 2:
+        return "INIT"
 
     last = hist[-1]
     prev = hist[-2]
@@ -116,7 +120,6 @@ def compute_signal(hist):
     if last["bid"] == 0 and last["ask"] == 0:
         return "SIN MERCADO"
 
-    # presión compradora fuerte
     if last["ask"] > 0 and last["bid"] / max(last["ask"], 1) > 10:
         return "BUY"
 
@@ -139,7 +142,13 @@ def bot_loop():
             for symbol in SYMBOLS:
                 data = get_quote(symbol)
 
-                if not data:
+                if data is None:
+                    # 👇 fallback para no quedar vacío
+                    last_signals[symbol] = {
+                        "price": 0,
+                        "signal": "ERROR",
+                        "time": datetime.now().strftime("%H:%M:%S")
+                    }
                     continue
 
                 history[symbol].append(data)
@@ -184,13 +193,12 @@ def home():
 
     return html
 
-
 @app.get("/data")
 def data():
     return JSONResponse(content=last_signals)
 
 # ==========================
-# MAIN (FIX RAILWAY)
+# MAIN
 # ==========================
 if __name__ == "__main__":
     print("[INIT] Starting bot thread...", flush=True)
