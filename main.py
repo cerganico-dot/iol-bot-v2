@@ -37,22 +37,32 @@ last_signals = {}
 # ==========================
 def login():
     global token, token_expiry
-    print("[LOGIN TRY]")
-    r = requests.post(LOGIN_URL, data={
-        "username": USERNAME,
-        "password": PASSWORD,
-        "grant_type": "password"
-    })
+    try:
+        print("[LOGIN TRY]", flush=True)
 
-    if r.status_code == 200:
-        data = r.json()
-        token = data["access_token"]
-        token_expiry = time.time() + data["expires_in"] - 60
-        print("[LOGIN OK]")
-    else:
-        print("[LOGIN ERROR]", r.text)
+        r = requests.post(
+            LOGIN_URL,
+            data={
+                "username": USERNAME,
+                "password": PASSWORD,
+                "grant_type": "password"
+            },
+            timeout=10
+        )
 
-def headers():
+        if r.status_code == 200:
+            data = r.json()
+            token = data["access_token"]
+            token_expiry = time.time() + data["expires_in"] - 60
+            print("[LOGIN OK]", flush=True)
+        else:
+            print("[LOGIN ERROR]", r.text, flush=True)
+
+    except Exception as e:
+        print("[LOGIN EXCEPTION]", e, flush=True)
+
+
+def get_headers():
     global token
     if token is None or time.time() > token_expiry:
         login()
@@ -63,36 +73,38 @@ def headers():
 # ==========================
 def get_quote(symbol):
     try:
-        r = requests.get(f"{QUOTE_URL}/{symbol}/Cotizacion", headers=headers())
+        url = f"{QUOTE_URL}/{symbol}/Cotizacion"
+
+        r = requests.get(url, headers=get_headers(), timeout=10)
         data = r.json()
 
-        print(f"[DEBUG DATA] {symbol}:", data)
+        print(f"[DEBUG DATA] {symbol}: {data}", flush=True)
 
         price = data.get("ultimoPrecio")
         puntas = data.get("puntas", [])
 
-        if not price:
-            print(f"[NO PRICE] {symbol}")
+        if price is None:
+            print(f"[NO PRICE] {symbol}", flush=True)
             return None
 
         if not puntas:
-            print(f"[NO PUNTAS] {symbol}")
+            print(f"[NO PUNTAS] {symbol}", flush=True)
             return {"price": price, "bid": 0, "ask": 0}
 
         p = puntas[0]
 
         return {
             "price": price,
-            "bid": p["cantidadCompra"],
-            "ask": p["cantidadVenta"]
+            "bid": p.get("cantidadCompra", 0),
+            "ask": p.get("cantidadVenta", 0)
         }
 
     except Exception as e:
-        print("[ERROR GET QUOTE]", e)
+        print(f"[ERROR GET QUOTE] {symbol}: {e}", flush=True)
         return None
 
 # ==========================
-# SIGNAL
+# SIGNAL LOGIC
 # ==========================
 def compute_signal(hist):
     if len(hist) < 3:
@@ -104,12 +116,14 @@ def compute_signal(hist):
     if last["bid"] == 0 and last["ask"] == 0:
         return "SIN MERCADO"
 
-    if last["ask"] > 0 and last["bid"] / last["ask"] > 10:
+    # presión compradora fuerte
+    if last["ask"] > 0 and last["bid"] / max(last["ask"], 1) > 10:
         return "BUY"
 
     if last["price"] > prev["price"]:
         return "UP"
-    elif last["price"] < prev["price"]:
+
+    if last["price"] < prev["price"]:
         return "DOWN"
 
     return "FLAT"
@@ -118,47 +132,37 @@ def compute_signal(hist):
 # BOT LOOP
 # ==========================
 def bot_loop():
-    print("[BOT STARTED]")
+    print("[BOT STARTED]", flush=True)
 
     while True:
         try:
-            for s in SYMBOLS:
-                d = get_quote(s)
+            for symbol in SYMBOLS:
+                data = get_quote(symbol)
 
-                if not d:
+                if not data:
                     continue
 
-                history[s].append(d)
-                signal = compute_signal(history[s])
+                history[symbol].append(data)
+                signal = compute_signal(history[symbol])
 
-                last_signals[s] = {
-                    "price": d["price"],
+                last_signals[symbol] = {
+                    "price": data["price"],
                     "signal": signal,
                     "time": datetime.now().strftime("%H:%M:%S")
                 }
 
-                print(f"[SIGNAL] {s} {d['price']} {signal}")
+                print(f"[SIGNAL] {symbol} {data['price']} {signal}", flush=True)
 
             time.sleep(REFRESH)
 
         except Exception as e:
-            print("[LOOP ERROR]", e)
+            print("[LOOP ERROR]", e, flush=True)
             time.sleep(5)
 
 # ==========================
 # API
 # ==========================
 app = FastAPI()
-
-if __name__ == "__main__":
-    print("[INIT] Starting bot thread...")
-
-    t = threading.Thread(target=bot_loop, daemon=True)
-    t.start()
-
-    print("[INIT] Starting API...")
-
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -167,25 +171,33 @@ def home():
     if not last_signals:
         html += "<p>Cargando datos...</p>"
 
-    for s, data in last_signals.items():
+    for s, d in last_signals.items():
         html += f"""
         <div>
             <h2>{s}</h2>
-            <p>Precio: {data['price']}</p>
-            <p>Señal: <b>{data['signal']}</b></p>
-            <p>Hora: {data['time']}</p>
+            <p>Precio: {d['price']}</p>
+            <p>Señal: <b>{d['signal']}</b></p>
+            <p>Hora: {d['time']}</p>
         </div>
         <hr>
         """
 
     return html
 
+
 @app.get("/data")
 def data():
     return JSONResponse(content=last_signals)
 
 # ==========================
-# MAIN
+# MAIN (FIX RAILWAY)
 # ==========================
 if __name__ == "__main__":
+    print("[INIT] Starting bot thread...", flush=True)
+
+    t = threading.Thread(target=bot_loop, daemon=True)
+    t.start()
+
+    print("[INIT] Starting API...", flush=True)
+
     uvicorn.run(app, host="0.0.0.0", port=PORT)
