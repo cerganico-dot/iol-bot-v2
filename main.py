@@ -6,7 +6,6 @@ from collections import deque
 from datetime import datetime
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
-import uvicorn
 
 # ==========================
 # CONFIG
@@ -22,50 +21,61 @@ HISTORY_LEN = 20
 
 USERNAME = os.getenv("IOL_USER")
 PASSWORD = os.getenv("IOL_PASS")
-PORT = int(os.getenv("PORT", 8080))
 
 # ==========================
 # STATE
 # ==========================
 token = None
 token_expiry = 0
+
 history = {s: deque(maxlen=HISTORY_LEN) for s in SYMBOLS}
 last_signals = {}
+
+bot_running = False  # 🔥 evita múltiples threads
 
 # ==========================
 # AUTH
 # ==========================
 def login():
     global token, token_expiry
-    try:
-        print("[LOGIN TRY]", flush=True)
 
-        r = requests.post(
-            LOGIN_URL,
-            data={
-                "username": USERNAME,
-                "password": PASSWORD,
-                "grant_type": "password"
-            },
-            timeout=10
-        )
+    for i in range(3):
+        try:
+            print(f"[LOGIN TRY {i}]", flush=True)
 
-        if r.status_code == 200:
-            data = r.json()
-            token = data["access_token"]
-            token_expiry = time.time() + data["expires_in"] - 60
-            print("[LOGIN OK]", flush=True)
-        else:
-            print("[LOGIN ERROR]", r.text, flush=True)
+            r = requests.post(
+                LOGIN_URL,
+                data={
+                    "username": USERNAME,
+                    "password": PASSWORD,
+                    "grant_type": "password"
+                },
+                timeout=10
+            )
 
-    except Exception as e:
-        print("[LOGIN EXCEPTION]", e, flush=True)
+            if r.status_code == 200:
+                data = r.json()
+                token = data["access_token"]
+                token_expiry = time.time() + data["expires_in"] - 60
+                print("[LOGIN OK]", flush=True)
+                return
+
+            print("[LOGIN FAIL]", r.text, flush=True)
+
+        except Exception as e:
+            print("[LOGIN ERROR]", e, flush=True)
+
+        time.sleep(2)
+
+    print("[LOGIN GAVE UP]", flush=True)
 
 
 def get_headers():
     global token
+
     if token is None or time.time() > token_expiry:
         login()
+
     return {"Authorization": f"Bearer {token}"}
 
 # ==========================
@@ -78,7 +88,7 @@ def get_quote(symbol):
         r = requests.get(url, headers=get_headers(), timeout=10)
 
         if r.status_code != 200:
-            print(f"[HTTP ERROR] {symbol}: {r.status_code}", flush=True)
+            print(f"[HTTP ERROR] {symbol} {r.status_code}", flush=True)
             return None
 
         data = r.json()
@@ -86,12 +96,11 @@ def get_quote(symbol):
         price = data.get("ultimoPrecio")
         puntas = data.get("puntas", [])
 
-        print(f"[DATA OK] {symbol} price={price}", flush=True)
+        print(f"[DATA] {symbol} {price}", flush=True)
 
         if price is None:
             return None
 
-        # fallback si no hay mercado
         if not puntas:
             return {"price": price, "bid": 0, "ask": 0}
 
@@ -104,7 +113,7 @@ def get_quote(symbol):
         }
 
     except Exception as e:
-        print(f"[ERROR GET] {symbol}: {e}", flush=True)
+        print(f"[ERROR] {symbol} {e}", flush=True)
         return None
 
 # ==========================
@@ -139,28 +148,28 @@ def bot_loop():
 
     while True:
         try:
-            for symbol in SYMBOLS:
-                data = get_quote(symbol)
+            for s in SYMBOLS:
+                d = get_quote(s)
 
-                if data is None:
-                    # 👇 fallback para no quedar vacío
-                    last_signals[symbol] = {
+                if d is None:
+                    last_signals[s] = {
                         "price": 0,
                         "signal": "ERROR",
                         "time": datetime.now().strftime("%H:%M:%S")
                     }
                     continue
 
-                history[symbol].append(data)
-                signal = compute_signal(history[symbol])
+                history[s].append(d)
 
-                last_signals[symbol] = {
-                    "price": data["price"],
+                signal = compute_signal(history[s])
+
+                last_signals[s] = {
+                    "price": d["price"],
                     "signal": signal,
                     "time": datetime.now().strftime("%H:%M:%S")
                 }
 
-                print(f"[SIGNAL] {symbol} {data['price']} {signal}", flush=True)
+                print(f"[SIGNAL] {s} {d['price']} {signal}", flush=True)
 
             time.sleep(REFRESH)
 
@@ -172,6 +181,22 @@ def bot_loop():
 # API
 # ==========================
 app = FastAPI()
+
+@app.on_event("startup")
+def startup():
+    global bot_running
+
+    print("[STARTUP EVENT]", flush=True)
+
+    if not bot_running:
+        print("[STARTING BOT THREAD]", flush=True)
+
+        t = threading.Thread(target=bot_loop, daemon=True)
+        t.start()
+
+        bot_running = True
+    else:
+        print("[BOT ALREADY RUNNING]", flush=True)
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -196,16 +221,3 @@ def home():
 @app.get("/data")
 def data():
     return JSONResponse(content=last_signals)
-
-# ==========================
-# MAIN
-# ==========================
-if __name__ == "__main__":
-    print("[INIT] Starting bot thread...", flush=True)
-
-    t = threading.Thread(target=bot_loop, daemon=True)
-    t.start()
-
-    print("[INIT] Starting API...", flush=True)
-
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
