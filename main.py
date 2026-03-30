@@ -78,51 +78,41 @@ def get_headers():
 # ==========================
 # DATA FETCH (DEBUG ROBUSTO)
 # ==========================
+
 def get_quote(symbol):
     try:
         url = f"{QUOTE_URL}/{symbol}/Cotizacion"
         response = requests.get(url, headers=get_headers(), timeout=TIMEOUT)
 
+        print(f"[DEBUG] {symbol} STATUS: {response.status_code}", flush=True)
+
         if response.status_code != 200:
             print(f"[HTTP ERROR] {symbol} {response.status_code}", flush=True)
+            print(response.text, flush=True)
             return None
 
         data = response.json()
 
-        if not isinstance(data, dict):
-            print(f"[FORMAT ERROR] {symbol}", flush=True)
-            return None
+        print(f"[DEBUG DATA] {symbol}: {data}", flush=True)
 
         price = data.get("ultimoPrecio")
         puntas = data.get("puntas", [])
 
-        if not isinstance(puntas, list) or len(puntas) == 0:
-            print(f"[NO BOOK] {symbol}", flush=True)
+        if not puntas:
+            print(f"[NO PUNTAS] {symbol}", flush=True)
             return None
 
-        punta = puntas[0] if isinstance(puntas[0], dict) else {}
-
-        bid_size = punta.get("cantidadCompra")
-        ask_size = punta.get("cantidadVenta")
-
-        if price is None:
-            print(f"[NO PRICE] {symbol}", flush=True)
-            return None
-
-        if bid_size is None or ask_size is None:
-            print(f"[NO SIZE] {symbol}", flush=True)
-            return None
+        punta = puntas[0]
 
         return {
             "price": float(price),
-            "bid_size": float(bid_size),
-            "ask_size": float(ask_size)
+            "bid_size": float(punta.get("cantidadCompra", 0)),
+            "ask_size": float(punta.get("cantidadVenta", 0))
         }
 
     except Exception as e:
         print(f"[DATA ERROR] {symbol} {e}", flush=True)
         return None
-
 # ==========================
 # SIGNALS
 # ==========================
