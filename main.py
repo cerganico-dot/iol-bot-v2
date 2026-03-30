@@ -150,10 +150,15 @@ def bot_loop():
 # ==========================
 app = FastAPI()
 
-@app.on_event("startup")
-def start_bot():
+if __name__ == "__main__":
+    print("[INIT] Starting bot thread...")
+
     t = threading.Thread(target=bot_loop, daemon=True)
     t.start()
+
+    print("[INIT] Starting API...")
+
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
 
 @app.get("/", response_class=HTMLResponse)
 def home():
