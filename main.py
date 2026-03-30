@@ -76,7 +76,7 @@ def get_headers():
     return {"Authorization": f"Bearer {token}"}
 
 # ==========================
-# DATA FETCH
+# DATA FETCH (DEBUG ROBUSTO)
 # ==========================
 def get_quote(symbol):
     try:
@@ -84,16 +84,20 @@ def get_quote(symbol):
         response = requests.get(url, headers=get_headers(), timeout=TIMEOUT)
 
         if response.status_code != 200:
+            print(f"[HTTP ERROR] {symbol} {response.status_code}", flush=True)
             return None
 
         data = response.json()
+
         if not isinstance(data, dict):
+            print(f"[FORMAT ERROR] {symbol}", flush=True)
             return None
 
         price = data.get("ultimoPrecio")
-
         puntas = data.get("puntas", [])
+
         if not isinstance(puntas, list) or len(puntas) == 0:
+            print(f"[NO BOOK] {symbol}", flush=True)
             return None
 
         punta = puntas[0] if isinstance(puntas[0], dict) else {}
@@ -101,7 +105,12 @@ def get_quote(symbol):
         bid_size = punta.get("cantidadCompra")
         ask_size = punta.get("cantidadVenta")
 
-        if price is None or bid_size is None or ask_size is None:
+        if price is None:
+            print(f"[NO PRICE] {symbol}", flush=True)
+            return None
+
+        if bid_size is None or ask_size is None:
+            print(f"[NO SIZE] {symbol}", flush=True)
             return None
 
         return {
@@ -260,6 +269,7 @@ def run():
         try:
             for symbol in SYMBOLS:
                 data = get_quote(symbol)
+
                 if data is None:
                     continue
 
@@ -273,6 +283,7 @@ def run():
                     ml_prob = predict(features)
 
                 label = generate_label(history[symbol])
+
                 if features and label is not None:
                     train(features, label)
 
