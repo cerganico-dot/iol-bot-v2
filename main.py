@@ -18,6 +18,7 @@ SYMBOLS = ["AL30", "GD30"]
 
 REFRESH = int(os.getenv("REFRESH", 5))
 HISTORY_LEN = 20
+CANDLE_SECONDS = 60
 
 USERNAME = os.getenv("IOL_USER")
 PASSWORD = os.getenv("IOL_PASS")
@@ -31,7 +32,10 @@ token_expiry = 0
 history = {s: deque(maxlen=HISTORY_LEN) for s in SYMBOLS}
 last_signals = {}
 
-bot_running = False  # 🔥 evita múltiples threads
+candles = {s: [] for s in SYMBOLS}
+current_candle = {}
+
+bot_running = False
 
 # ==========================
 # AUTH
@@ -60,15 +64,12 @@ def login():
                 print("[LOGIN OK]", flush=True)
                 return
 
-            print("[LOGIN FAIL]", r.text, flush=True)
-
         except Exception as e:
             print("[LOGIN ERROR]", e, flush=True)
 
         time.sleep(2)
 
-    print("[LOGIN GAVE UP]", flush=True)
-
+    print("[LOGIN FAILED]", flush=True)
 
 def get_headers():
     global token
@@ -84,19 +85,14 @@ def get_headers():
 def get_quote(symbol):
     try:
         url = f"{QUOTE_URL}/{symbol}/Cotizacion"
-
         r = requests.get(url, headers=get_headers(), timeout=10)
 
         if r.status_code != 200:
-            print(f"[HTTP ERROR] {symbol} {r.status_code}", flush=True)
             return None
 
         data = r.json()
-
         price = data.get("ultimoPrecio")
         puntas = data.get("puntas", [])
-
-        print(f"[DATA] {symbol} {price}", flush=True)
 
         if price is None:
             return None
@@ -113,8 +109,45 @@ def get_quote(symbol):
         }
 
     except Exception as e:
-        print(f"[ERROR] {symbol} {e}", flush=True)
+        print("[ERROR]", e, flush=True)
         return None
+
+# ==========================
+# VELAS
+# ==========================
+def update_candle(symbol, price):
+    now = int(time.time())
+    bucket = now - (now % CANDLE_SECONDS)
+
+    if symbol not in current_candle:
+        current_candle[symbol] = {
+            "time": bucket,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price
+        }
+        return
+
+    c = current_candle[symbol]
+
+    if c["time"] == bucket:
+        c["high"] = max(c["high"], price)
+        c["low"] = min(c["low"], price)
+        c["close"] = price
+    else:
+        candles[symbol].append(c.copy())
+
+        if len(candles[symbol]) > 200:
+            candles[symbol].pop(0)
+
+        current_candle[symbol] = {
+            "time": bucket,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price
+        }
 
 # ==========================
 # SIGNAL
@@ -152,14 +185,12 @@ def bot_loop():
                 d = get_quote(s)
 
                 if d is None:
-                    last_signals[s] = {
-                        "price": 0,
-                        "signal": "ERROR",
-                        "time": datetime.now().strftime("%H:%M:%S")
-                    }
                     continue
 
                 history[s].append(d)
+
+                # 🔥 UPDATE VELAS
+                update_candle(s, d["price"])
 
                 signal = compute_signal(history[s])
 
@@ -169,7 +200,7 @@ def bot_loop():
                     "time": datetime.now().strftime("%H:%M:%S")
                 }
 
-                print(f"[SIGNAL] {s} {d['price']} {signal}", flush=True)
+                print(f"[{s}] {d['price']} {signal}", flush=True)
 
             time.sleep(REFRESH)
 
@@ -186,38 +217,62 @@ app = FastAPI()
 def startup():
     global bot_running
 
-    print("[STARTUP EVENT]", flush=True)
+    print("[STARTUP]", flush=True)
 
     if not bot_running:
-        print("[STARTING BOT THREAD]", flush=True)
-
         t = threading.Thread(target=bot_loop, daemon=True)
         t.start()
-
         bot_running = True
-    else:
-        print("[BOT ALREADY RUNNING]", flush=True)
-
-@app.get("/", response_class=HTMLResponse)
-def home():
-    html = "<h1>📊 BOT EN VIVO</h1>"
-
-    if not last_signals:
-        html += "<p>Cargando datos...</p>"
-
-    for s, d in last_signals.items():
-        html += f"""
-        <div>
-            <h2>{s}</h2>
-            <p>Precio: {d['price']}</p>
-            <p>Señal: <b>{d['signal']}</b></p>
-            <p>Hora: {d['time']}</p>
-        </div>
-        <hr>
-        """
-
-    return html
 
 @app.get("/data")
 def data():
     return JSONResponse(content=last_signals)
+
+@app.get("/candles")
+def get_candles():
+    return JSONResponse(content=candles)
+
+# ==========================
+# DASHBOARD CON GRAFICO
+# ==========================
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <html>
+    <head>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    </head>
+    <body>
+    <h1>📊 BOT EN VIVO</h1>
+    <canvas id="chart"></canvas>
+
+    <script>
+    async function load() {
+        const res = await fetch('/candles');
+        const data = await res.json();
+
+        const symbol = Object.keys(data)[0];
+        const candles = data[symbol];
+
+        const labels = candles.map(c => new Date(c.time * 1000).toLocaleTimeString());
+        const prices = candles.map(c => c.close);
+
+        new Chart(document.getElementById('chart'), {
+            type: 'line',
+            data: {
+                labels: labels,
+                datasets: [{
+                    label: symbol,
+                    data: prices
+                }]
+            }
+        });
+    }
+
+    load();
+    setInterval(() => location.reload(), 10000);
+    </script>
+
+    </body>
+    </html>
+    """
